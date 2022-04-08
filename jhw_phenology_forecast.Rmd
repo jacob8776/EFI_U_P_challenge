@@ -1,0 +1,247 @@
+---
+title: "JHW_PHENOLOGY_FORECAST"
+author: "Jacob Wynne"
+date: "4/30/2021"
+output: html_document
+---
+
+---
+title: "Calibrating sites JHW MR"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(nimble)
+library(rjags)
+library(lubridate)
+library(tidybayes)
+library(tidyverse)
+library(lubridate)
+```
+
+
+```{r}
+d <- read_csv(file = "https://data.ecoforecast.org/targets/phenology/phenology-targets.csv.gz")
+bart_spring <- d  %>%
+  mutate(doy = yday(time)) %>% 
+  filter(siteID == "BART",
+         time >= "2021-01-01",
+         doy < 180) %>% 
+  filter(!is.na(gcc_90),
+         gcc_sd > 0)
+
+dates <- seq(as.Date("2021-04-13"), as.Date("2021-05-05"), by="days")
+
+dates <- as.data.frame(dates)
+
+colnames(dates) <- c("time")
+dates$siteID <- "BART"
+dates$gcc_90 <- NA
+dates$gcc_sd <- NA
+mdates <- dates %>% 
+  mutate(doy = yday(time))
+
+
+bart_spring <- rbind(bart_spring, mdates)
+
+date <- Sys.Date()
+naafter <- yday(date)
+
+```
+
+
+
+```{r}
+
+all_sites <- NULL
+# all_sites <- rbind(all_sites, new_site)
+
+sites <- unique(d$siteID)
+
+for(s in sites){
+d <- read_csv(file = "https://data.ecoforecast.org/targets/phenology/phenology-targets.csv.gz")
+bart_spring <- d  %>%
+  mutate(doy = yday(time)) %>%
+  filter(siteID == s,
+         doy < 215) %>%
+  filter(!is.na(gcc_90),
+         gcc_sd > 0)
+
+
+
+
+
+
+ggplot(bart_spring, aes(x = doy, y = gcc_90)) +
+  geom_point()
+
+
+logistic <- nimbleCode({
+
+  # Priors
+  theta1 ~ dnorm(0, sd = 10000)
+  theta2 ~ dnorm(0, sd = 10000)
+  theta3 <- -50
+  theta4 ~ dnorm(0, sd = 10000)
+  sd_data ~ dunif(0.00001, 100)
+
+
+  #Loop through data points
+  for(i in 1:n){
+      # Process model
+      pred[i] <- theta1 + theta2 * exp(theta3 + theta4 * x[i]) / (1 + exp(theta3 + theta4 * x[i])) 
+      # Data model
+      y[i]  ~ dnorm(pred[i], sd = sd_data)
+  }
+
+})
+
+
+constants <- list(n = length(bart_spring$doy))
+
+data <- list(x = bart_spring$doy,
+             y = bart_spring$gcc_90)
+
+nchain <- 3
+inits <- list()
+for(i in 1:nchain){
+  inits[[i]] <- list(theta1 = rnorm(1, 0.34, 0.05), 
+                     theta2 = rnorm(1, 0.11, 0.05),
+                     #theta3 = rnorm(1, -50, 5),
+                     theta4 = rnorm(1, 0.4, 0.05),
+                     sd_data = runif(1, 0.05, 0.15 ))
+}
+
+nimble.out <- nimbleMCMC(code = logistic,
+                           data = data,
+                           inits = inits,
+                           constants = constants,
+                           monitors = c("theta1", 
+                                        "theta2",
+                                       #"theta3", 
+                                        "theta4", 
+                                        "sd_data"),
+                           niter = 10000,
+                           nchains = 3,
+                           samplesAsCodaMCMC = TRUE)
+
+
+
+#plot(nimble.out$chain1)#
+#plot(nimble.out$chain2)
+#plot(nimble.out$chain3)
+
+gelman.diag(nimble.out)  ## determine convergence
+
+burnin <- 1000                               
+nimble.burn <- window(nimble.out, start=burnin)
+
+#plot(nimble.burn$chain1)
+#plot(nimble.burn$chain2)
+#plot(nimble.burn$chain3)
+#
+effectiveSize(nimble.burn)
+gelman.diag(nimble.burn)  ## determine convergence
+
+chain <- nimble.burn %>%
+  tidybayes::spread_draws(theta1, theta2, theta4, sd_data)
+
+pred_function <- function(x, theta1, theta2, theta3, theta4){
+  theta1 + theta2 * exp(theta3 + theta4 * x) / (1 + exp(theta3 + theta4 * x))
+}
+
+num_samples <- 1000
+x_new <- 123:158
+pred_posterior_mean <- matrix(NA, num_samples, length(x_new))   # storage for all simulations
+y_posterior <- matrix(NA, num_samples, length(x_new)) 
+
+for(i in 1:num_samples){
+  sample_index <- sample(x = 1:nrow(chain), size = 1, replace = TRUE)
+  pred_posterior_mean[i, ] <-pred_function(x_new, 
+                                           theta1 = chain$theta1[sample_index],
+                                           theta2 = chain$theta2[sample_index],
+                                           theta3 = -50,
+                                           theta4 = chain$theta4[sample_index])
+  
+  
+  y_posterior[i, ] <- rnorm(length(x_new), pred_posterior_mean[i, ], sd = chain$sd_data[sample_index])
+  
+}
+n.stats.y <- apply(y_posterior, 2, quantile, c(0.025, 0.5, 0.975))
+n.stats.y.mean <- apply(y_posterior, 2, mean)
+n.stats.y.sd <- apply(y_posterior, 2, sd)
+
+
+n.stats.mean <- apply(pred_posterior_mean, 2, quantile, c(0.025, 0.5, 0.975))
+
+d <- tibble(x = x_new,
+            mean = n.stats.y.mean,
+            sd = n.stats.y.sd,
+            lower95_y = n.stats.y[1, ],
+            upper95_y = n.stats.y[3, ],
+            lower95_mean = n.stats.mean[1, ],
+            upper95_mean = n.stats.mean[3, ], 
+            siteID = s, 
+            data_assimilation = 0, 
+            forecast = 1)
+
+ggplot(d, aes(x = x)) +
+  geom_ribbon(aes(ymin = lower95_y, ymax = upper95_y), fill = "lightblue", alpha = 0.5) +
+  geom_ribbon(aes(ymin = lower95_mean, ymax = upper95_mean), fill = "pink", alpha = 0.5) +
+  geom_line(aes(y = mean)) +
+  labs(y = "Phenology DOY model")
+
+mean(chain$theta1)
+mean(chain$theta2)
+mean(chain$theta4)
+mean(chain$sd_data)
+
+
+fdate <- naafter + 38  
+
+newd <- subset(d, x > naafter & x < fdate)
+ggplot(newd, aes(x = x)) +
+  geom_ribbon(aes(ymin = lower95_y, ymax = upper95_y), fill = "lightblue", alpha = 0.5) +
+  geom_ribbon(aes(ymin = lower95_mean, ymax = upper95_mean), fill = "pink", alpha = 0.5) +
+  geom_line(aes(y = mean)) +
+  geom_point(aes(y = obs), color = "gray", alpha = 0.3) +
+  labs(y = "Phenology DOY model")
+
+d$time <-  as.Date(d$x, origin = "2021-01-01")
+
+
+
+new_site <- d %>% 
+  select(time, siteID, forecast, data_assimilation, mean, sd) %>% 
+  pivot_longer(cols = c("mean", "sd"), names_to = "statistic", values_to = "gcc_90")
+
+all_sites <- rbind(all_sites, new_site)
+
+}
+
+```
+
+```{r}
+
+# bart <- filter(all_sites, statistic == "mean")
+# 
+# ggplot(bart, aes(x = time, y = gcc_90, col = as.factor(siteID))) + geom_point()
+# 
+# write_csv(all_sites, "phenology-2021-05-03-EFI_U_Pnew.csv")
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
